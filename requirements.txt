@@ -1,0 +1,24 @@
+# Biblioteca principal para extração de texto
+docling
+
+# Conexão com banco de dados
+psycopg2-binary
+
+# Conexão com Redis
+redis
+
+# Conexão com Cloudflare R2 (compatível com S3)
+boto3
+
+# Variáveis de ambiente
+python-dotenv
+
+# Processamento de datas
+pytz
+
+# Geração de embeddings
+sentence-transformers
+numpy
+
+# Monitoramento do sistema
+psutil

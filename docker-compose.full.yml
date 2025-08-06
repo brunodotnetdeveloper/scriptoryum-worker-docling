@@ -1,0 +1,78 @@
+version: '3.8'
+
+services:
+  # Serviço principal do worker para processamento de documentos
+  document-worker:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    env_file:
+      - .env
+    volumes:
+      - ./:/app
+    command: python worker.py
+    restart: unless-stopped
+    networks:
+      - scriptoryum-network
+    deploy:
+      resources:
+        limits:
+          memory: 1G
+  
+  # Serviço para geração de embeddings
+  embedding-generator:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    env_file:
+      - .env
+    volumes:
+      - ./:/app
+    command: python embedding_generator.py
+    restart: unless-stopped
+    networks:
+      - scriptoryum-network
+    deploy:
+      resources:
+        limits:
+          memory: 2G
+  
+  # Serviço para monitoramento do sistema
+  system-monitor:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    env_file:
+      - .env
+    volumes:
+      - ./:/app
+    command: python monitor.py
+    restart: unless-stopped
+    networks:
+      - scriptoryum-network
+    deploy:
+      resources:
+        limits:
+          memory: 256M
+  
+  # Serviço para monitoramento e gerenciamento dos processos
+  process-manager:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    env_file:
+      - .env
+    volumes:
+      - ./:/app
+    command: python run_all.py
+    restart: unless-stopped
+    networks:
+      - scriptoryum-network
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+
+networks:
+  scriptoryum-network:
+    driver: bridge

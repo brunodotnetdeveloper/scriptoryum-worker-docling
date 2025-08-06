@@ -1,0 +1,43 @@
+# Arquivos de sistema
+.git
+.gitignore
+.DS_Store
+
+# Arquivos de ambiente e configuração local
+.env.local
+.env.*.local
+
+# Arquivos de cache Python
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Ambientes virtuais
+venv/
+env/
+ENV/
+
+# Arquivos de log
+*.log
+logs/
+
+# Arquivos temporários
+tmp/
+temp/
+
+# Arquivos de documentação
+docs/
+*.md
+!README.md
+
+# Arquivos Docker (exceto o Dockerfile principal)
+docker-compose*.yml
+
+# Outros arquivos que não são necessários no container
+.vscode/
+.idea/
+*.swp
+*.swo
