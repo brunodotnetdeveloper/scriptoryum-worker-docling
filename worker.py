@@ -106,10 +106,10 @@ class DocumentProcessor:
             
             params = [status, datetime.datetime.now()]
             
-            # Se estamos iniciando o processamento, atualize o campo processing_started_at
-            if status == DocumentStatus.EXTRACTING_TEXT:
-                update_query += ", processing_started_at = %s"
-                params.append(datetime.datetime.now())
+            # Comentando a atualização do campo processing_started_at pois está causando erros
+            # if status == DocumentStatus.EXTRACTING_TEXT:
+            #     update_query += ", processing_started_at = %s"
+            #     params.append(datetime.datetime.now())
             
             # Se temos texto extraído, atualize o campo text_extracted
             if text_extracted is not None:
