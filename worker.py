@@ -89,6 +89,9 @@ class DocumentProcessor:
         
         # Inicializa o conversor de documentos Docling
         self.doc_converter = DocumentConverter()
+        
+        # Tempo máximo (em minutos) que um documento pode ficar no status ExtractingText
+        self.max_extracting_time_minutes = 30
     
     def update_document_status(self, document_id, status, text_extracted=None, summary=None):
         """Atualiza o status do documento no banco de dados."""
@@ -165,6 +168,14 @@ class DocumentProcessor:
             # Extrai o texto do documento convertido
             text = result.document.export_to_text()
             
+            # Limita o tamanho do texto para evitar problemas com documentos muito grandes
+            # Define um limite máximo de 10MB para o texto extraído
+            max_text_size = 10 * 1024 * 1024  # 10MB em bytes
+            if len(text) > max_text_size:
+                logger.warning(f"Texto extraído muito grande ({len(text)} bytes), truncando para {max_text_size} bytes")
+                text = text[:max_text_size]
+                text += "\n\n[TEXTO TRUNCADO DEVIDO AO TAMANHO EXCESSIVO]"
+            
             # Gera um resumo simples (primeiros 1000 caracteres)
             summary = text[:1000] + "..." if len(text) > 1000 else text
             
@@ -172,7 +183,11 @@ class DocumentProcessor:
             return text, summary
         except Exception as e:
             logger.error(f"Erro ao extrair texto do documento: {str(e)}")
-            raise
+            logger.error(traceback.format_exc())
+            # Retorna um texto de erro e um resumo indicando a falha
+            error_text = f"ERRO NA EXTRAÇÃO DE TEXTO: {str(e)}"
+            return error_text, error_text
+            # Não propaga a exceção para permitir que o documento seja marcado como falha
     
     def process_document(self, document_data):
         """Processa um documento da fila."""
@@ -181,23 +196,87 @@ class DocumentProcessor:
         file_type = document_data.get('FileType')
         temp_file_path = None
         
+        # Validação básica dos dados do documento
+        if not document_id:
+            logger.error("DocumentId não encontrado nos dados do documento")
+            return False
+        
+        if not storage_path:
+            logger.error(f"StoragePath não encontrado para o documento {document_id}")
+            try:
+                self.update_document_status(document_id, DocumentStatus.TEXT_EXTRACTION_FAILED)
+            except Exception:
+                pass
+            return False
+        
         try:
             # Atualiza o status para ExtractingText
             self.update_document_status(document_id, DocumentStatus.EXTRACTING_TEXT)
             
             # Baixa o documento
-            temp_file_path = self.download_document(storage_path, file_type)
+            try:
+                temp_file_path = self.download_document(storage_path, file_type)
+            except Exception as download_error:
+                logger.error(f"Erro ao baixar documento {document_id}: {str(download_error)}")
+                logger.error(traceback.format_exc())
+                self.update_document_status(document_id, DocumentStatus.TEXT_EXTRACTION_FAILED)
+                return False
+            
+            # Verifica se o arquivo foi baixado corretamente
+            if not temp_file_path or not os.path.exists(temp_file_path):
+                logger.error(f"Arquivo temporário não encontrado para o documento {document_id}")
+                self.update_document_status(document_id, DocumentStatus.TEXT_EXTRACTION_FAILED)
+                return False
+            
+            # Verifica o tamanho do arquivo
+            try:
+                file_size = os.path.getsize(temp_file_path)
+                logger.info(f"Tamanho do arquivo do documento {document_id}: {file_size} bytes")
+                
+                # Se o arquivo for muito grande (mais de 100MB), marca como falha
+                max_file_size = 100 * 1024 * 1024  # 100MB em bytes
+                if file_size > max_file_size:
+                    logger.error(f"Documento {document_id} muito grande ({file_size} bytes), excede o limite de {max_file_size} bytes")
+                    self.update_document_status(document_id, DocumentStatus.TEXT_EXTRACTION_FAILED)
+                    return False
+            except Exception as size_error:
+                logger.error(f"Erro ao verificar tamanho do arquivo do documento {document_id}: {str(size_error)}")
             
             # Extrai o texto
             text, summary = self.extract_text(temp_file_path)
             
+            # Verifica se o texto contém mensagem de erro
+            if text.startswith("ERRO NA EXTRAÇÃO DE TEXTO"):
+                logger.error(f"Falha na extração de texto do documento {document_id}: {text}")
+                self.update_document_status(document_id, DocumentStatus.TEXT_EXTRACTION_FAILED)
+                return False
+            
             # Atualiza o documento com o texto extraído e status Processed
-            self.update_document_status(
-                document_id, 
-                DocumentStatus.PROCESSED, 
-                text_extracted=text,
-                summary=summary
-            )
+            try:
+                self.update_document_status(
+                    document_id, 
+                    DocumentStatus.PROCESSED, 
+                    text_extracted=text,
+                    summary=summary
+                )
+            except Exception as update_error:
+                logger.error(f"Erro ao atualizar documento {document_id} com texto extraído: {str(update_error)}")
+                logger.error(traceback.format_exc())
+                # Tenta novamente com um texto truncado se o erro for relacionado ao tamanho
+                if len(text) > 1000000:  # Se o texto for maior que 1MB
+                    logger.warning(f"Tentando atualizar documento {document_id} com texto truncado")
+                    truncated_text = text[:1000000] + "\n\n[TEXTO TRUNCADO DEVIDO AO TAMANHO EXCESSIVO]"
+                    try:
+                        self.update_document_status(
+                            document_id, 
+                            DocumentStatus.PROCESSED, 
+                            text_extracted=truncated_text,
+                            summary=summary
+                        )
+                    except Exception as truncate_error:
+                        logger.error(f"Erro ao atualizar documento {document_id} com texto truncado: {str(truncate_error)}")
+                        self.update_document_status(document_id, DocumentStatus.TEXT_EXTRACTION_FAILED)
+                        return False
             
             logger.info(f"Documento {document_id} processado com sucesso")
             return True
@@ -221,22 +300,92 @@ class DocumentProcessor:
                 except Exception as e:
                     logger.error(f"Erro ao remover arquivo temporário: {str(e)}")
     
+    def check_stuck_documents(self):
+        """Verifica documentos que estão presos no status ExtractingText por muito tempo."""
+        try:
+            cursor = self.db_conn.cursor()
+            
+            # Calcula o tempo limite para considerar um documento como preso
+            time_limit = datetime.datetime.now() - datetime.timedelta(minutes=self.max_extracting_time_minutes)
+            
+            # Busca documentos que estão no status ExtractingText por mais tempo que o limite
+            query = """
+            SELECT id, storage_path, file_type 
+            FROM public.documents 
+            WHERE status = %s AND updated_at < %s
+            LIMIT 10
+            """
+            
+            cursor.execute(query, (DocumentStatus.EXTRACTING_TEXT, time_limit))
+            stuck_documents = cursor.fetchall()
+            cursor.close()
+            
+            if stuck_documents:
+                logger.warning(f"Encontrados {len(stuck_documents)} documentos presos no status ExtractingText")
+                
+                for doc in stuck_documents:
+                    document_id, storage_path, file_type = doc
+                    logger.warning(f"Marcando documento {document_id} como falha (preso no status ExtractingText)")
+                    
+                    try:
+                        self.update_document_status(document_id, DocumentStatus.TEXT_EXTRACTION_FAILED)
+                        logger.info(f"Status do documento {document_id} atualizado para falha")
+                    except Exception as e:
+                        logger.error(f"Erro ao atualizar status do documento {document_id}: {str(e)}")
+            
+            return len(stuck_documents)
+        except Exception as e:
+            logger.error(f"Erro ao verificar documentos presos: {str(e)}")
+            logger.error(traceback.format_exc())
+            return 0
+    
     def run(self):
         """Executa o worker em loop, processando documentos da fila."""
         logger.info("Iniciando worker de processamento de documentos...")
         
+        # Contador para verificação periódica de documentos presos
+        check_counter = 0
+        
         while True:
             try:
+                # A cada 20 iterações, verifica documentos presos
+                check_counter += 1
+                if check_counter >= 20:
+                    logger.info("Verificando documentos presos...")
+                    self.check_stuck_documents()
+                    check_counter = 0
+                
                 # Tenta obter um documento da fila
                 queue_item = self.redis_client.lpop(self.queue_name)
                 
                 if queue_item:
-                    # Converte o item da fila para um dicionário
-                    document_data = json.loads(queue_item)
-                    logger.info(f"Documento obtido da fila: {document_data['DocumentId']}")
-                    
-                    # Processa o documento
-                    self.process_document(document_data)
+                    try:
+                        # Converte o item da fila para um dicionário
+                        document_data = json.loads(queue_item)
+                        document_id = document_data.get('DocumentId')
+                        logger.info(f"Documento obtido da fila: {document_id}")
+                        
+                        # Processa o documento com timeout de segurança
+                        try:
+                            # Processa o documento
+                            self.process_document(document_data)
+                        except Exception as doc_error:
+                            # Captura erros específicos do processamento do documento
+                            logger.error(f"Erro ao processar documento {document_id}: {str(doc_error)}")
+                            logger.error(traceback.format_exc())
+                            
+                            # Tenta atualizar o status para falha, mas não interrompe o worker
+                            try:
+                                self.update_document_status(document_id, DocumentStatus.TEXT_EXTRACTION_FAILED)
+                                logger.info(f"Status do documento {document_id} atualizado para falha")
+                            except Exception as update_error:
+                                logger.error(f"Erro ao atualizar status de falha para documento {document_id}: {str(update_error)}")
+                    except json.JSONDecodeError as json_error:
+                        logger.error(f"Erro ao decodificar JSON do item da fila: {str(json_error)}")
+                        logger.error(f"Item da fila: {queue_item}")
+                    except Exception as item_error:
+                        logger.error(f"Erro ao processar item da fila: {str(item_error)}")
+                        logger.error(traceback.format_exc())
                 else:
                     # Se não há documentos na fila, aguarda um pouco
                     logger.info("Nenhum documento na fila. Aguardando...")
@@ -245,6 +394,25 @@ class DocumentProcessor:
                 logger.error(f"Erro no loop principal: {str(e)}")
                 logger.error(traceback.format_exc())
                 time.sleep(10)  # Aguarda um pouco mais em caso de erro
+                # Tenta reconectar ao Redis se a conexão foi perdida
+                try:
+                    self.redis_client = redis.from_url(os.getenv('REDIS_CONNECTION_STRING'))
+                    logger.info("Reconectado ao Redis")
+                except Exception as redis_error:
+                    logger.error(f"Erro ao reconectar ao Redis: {str(redis_error)}")
+                # Tenta reconectar ao banco de dados se a conexão foi perdida
+                try:
+                    if self.db_conn.closed:
+                        self.db_conn = psycopg2.connect(
+                            host=os.getenv('DB_HOST'),
+                            database=os.getenv('DB_NAME'),
+                            user=os.getenv('DB_USER'),
+                            password=os.getenv('DB_PASSWORD'),
+                            port=os.getenv('DB_PORT')
+                        )
+                        logger.info("Reconectado ao banco de dados")
+                except Exception as db_error:
+                    logger.error(f"Erro ao reconectar ao banco de dados: {str(db_error)}")
 
 if __name__ == "__main__":
     try:
