@@ -8,7 +8,9 @@ Este worker é responsável por processar documentos enviados para o sistema Scr
 - Download de documentos do Cloudflare R2
 - Extração de texto usando Docling
 - Atualização do status e conteúdo no banco de dados PostgreSQL
-- Gerenciamento de erros e logging
+- **Sistema de reprocessamento automático** para documentos com falha
+- Monitoramento de sistema e métricas de processamento
+- Gerenciamento de erros e logging detalhado
 
 ## Requisitos
 
@@ -80,3 +82,50 @@ O worker possui tratamento de erros para lidar com falhas em diferentes etapas d
 - Falha na atualização do banco de dados
 
 Todos os erros são registrados no log para facilitar a depuração.
+
+## Sistema de Reprocessamento
+
+O sistema inclui um **reprocessador automático** que identifica e reprocessa documentos que falharam na extração de texto:
+
+### Características
+- Execução automática a cada 30 minutos (configurável)
+- Reprocessamento individual de documentos com status `TextExtractionFailed`
+- Controle de tentativas (máximo 3 por documento)
+- Marcação automática como falha permanente após esgotar tentativas
+- Integração com monitoramento e métricas
+
+### Configuração do Banco
+
+Antes de usar o reprocessador, execute:
+
+```bash
+psql -d seu_banco -f add_reprocessing_columns.sql
+```
+
+### Execução
+
+**Automática (recomendado):**
+```bash
+python run_all.py  # Inclui reprocessador
+```
+
+**Manual:**
+```bash
+# Modo contínuo
+python run_reprocessor.py
+
+# Execução única
+python run_reprocessor.py --run-once
+
+# Com configurações personalizadas
+python run_reprocessor.py --interval 60 --max-retries 5
+```
+
+### Monitoramento
+
+O monitor exibe estatísticas detalhadas sobre:
+- Documentos reprocessáveis
+- Distribuição de falhas por tentativas
+- Taxa de sucesso do reprocessamento
+
+Para mais detalhes, consulte [REPROCESSAMENTO.md](REPROCESSAMENTO.md).

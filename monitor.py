@@ -103,6 +103,25 @@ class SystemMonitor:
             """)
             status_counts = {row[0]: row[1] for row in cursor.fetchall()}
             
+            # Documentos com falha na extração de texto por número de tentativas
+            cursor.execute("""
+                SELECT COALESCE(retry_count, 0) as retry_count, COUNT(*) 
+                FROM public.documents 
+                WHERE status = 'TextExtractionFailed'
+                GROUP BY retry_count
+                ORDER BY retry_count
+            """)
+            failed_by_retry_count = {row[0]: row[1] for row in cursor.fetchall()}
+            
+            # Total de documentos que podem ser reprocessados (não esgotaram tentativas)
+            cursor.execute("""
+                SELECT COUNT(*) 
+                FROM public.documents 
+                WHERE status = 'TextExtractionFailed' 
+                  AND COALESCE(retry_count, 0) < 3
+            """)
+            reprocessable_documents = cursor.fetchone()[0]
+            
             # Tempo médio de processamento (para documentos processados)
             cursor.execute("""
                 SELECT AVG(EXTRACT(EPOCH FROM (updated_at - processing_started_at))) 
@@ -125,6 +144,8 @@ class SystemMonitor:
                 'timestamp': datetime.datetime.now(),
                 'total_documents': total_documents,
                 'status_counts': status_counts,
+                'failed_by_retry_count': failed_by_retry_count,
+                'reprocessable_documents': reprocessable_documents,
                 'avg_processing_time_seconds': avg_processing_time,
                 'total_chunks': total_chunks,
                 'chunks_with_embeddings': chunks_with_embeddings,
@@ -144,12 +165,20 @@ class SystemMonitor:
         
         processing_metrics = self.get_document_processing_metrics()
         if processing_metrics:
+            total_failed = processing_metrics['status_counts'].get('Failed', 0) + processing_metrics['status_counts'].get('TextExtractionFailed', 0)
+            
             logger.info(f"Métricas de processamento: Total de documentos: {processing_metrics['total_documents']}, "
                        f"Processados: {processing_metrics['status_counts'].get('Processed', 0)}, "
-                       f"Falhas: {processing_metrics['status_counts'].get('Failed', 0) + processing_metrics['status_counts'].get('TextExtractionFailed', 0)}, "
+                       f"Falhas: {total_failed}, "
+                       f"Reprocessáveis: {processing_metrics['reprocessable_documents']}, "
                        f"Tempo médio: {processing_metrics['avg_processing_time_seconds']:.2f}s, "
                        f"Chunks: {processing_metrics['total_chunks']}, "
                        f"Embeddings: {processing_metrics['chunks_with_embeddings']} ({processing_metrics['embedding_completion_percent']:.2f}%)")
+            
+            # Log detalhado sobre falhas por tentativas se houver documentos com falha
+            if processing_metrics['failed_by_retry_count']:
+                retry_info = ", ".join([f"{count} docs com {retries} tentativas" for retries, count in processing_metrics['failed_by_retry_count'].items()])
+                logger.info(f"Detalhes de falhas na extração: {retry_info}")
     
     def run(self):
         """Executa o monitor em loop."""

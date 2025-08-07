@@ -109,6 +109,12 @@ def main():
     # Inicia o gerador de embeddings
     start_process('embedding_generator.py', 'Embedding Generator')
     
+    # Aguarda um pouco para garantir que os outros processos estejam em execução
+    time.sleep(2)
+    
+    # Inicia o reprocessador de documentos
+    start_process('reprocessor.py', 'Document Reprocessor')
+    
     # Inicia o monitor de processos
     try:
         monitor_processes()
