@@ -12,7 +12,6 @@ from dotenv import load_dotenv
 from enum import Enum
 from botocore.client import Config
 from docling.document_converter import DocumentConverter
-from text_chunker import TextChunker
 
 # Configuração de logging
 logging.basicConfig(
@@ -90,9 +89,6 @@ class DocumentProcessor:
         
         # Inicializa o conversor de documentos Docling
         self.doc_converter = DocumentConverter()
-        
-        # Inicializa o chunker para dividir o texto em partes menores
-        self.text_chunker = TextChunker(chunk_size=1000, chunk_overlap=200)
     
     def update_document_status(self, document_id, status, text_extracted=None, summary=None):
         """Atualiza o status do documento no banco de dados."""
@@ -202,17 +198,6 @@ class DocumentProcessor:
                 text_extracted=text,
                 summary=summary
             )
-            
-            # Divide o texto em chunks para processamento semântico
-            try:
-                logger.info(f"Dividindo texto do documento {document_id} em chunks")
-                num_chunks = self.text_chunker.create_chunks(text, document_id)
-                logger.info(f"Documento {document_id} dividido em {num_chunks} chunks")
-            except Exception as chunk_error:
-                logger.error(f"Erro ao dividir documento {document_id} em chunks: {str(chunk_error)}")
-                logger.error(traceback.format_exc())
-                # Continua o processamento mesmo se o chunking falhar
-                # O documento ainda é considerado processado, mas sem chunks
             
             logger.info(f"Documento {document_id} processado com sucesso")
             return True
