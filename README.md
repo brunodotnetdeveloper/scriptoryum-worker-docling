@@ -43,24 +43,52 @@ CLOUDFLARE_SERVICE_URL=url_do_servico
 
 ## Execução
 
-### Usando Docker Compose
-
+### Execução Local
 ```bash
-docker-compose up --build
+# Todos os serviços (recomendado)
+python run_all.py
+
+# Apenas worker
+python worker.py
+
+# Apenas reprocessador
+python run_reprocessor.py
+
+# Apenas monitor
+python monitor.py
 ```
 
-### Execução local (sem Docker)
+### Execução com Docker
+```bash
+# Build da imagem
+docker build -t scriptoryum-worker .
 
-1. Instale as dependências:
+# Modo completo (todos os serviços) - PADRÃO
+docker run -d --name scriptoryum-worker --env-file .env scriptoryum-worker
+
+# Apenas worker (sem reprocessador)
+docker run -d --name scriptoryum-worker-only --env-file .env -e RUN_MODE=worker-only scriptoryum-worker
+
+# Apenas reprocessador
+docker run -d --name scriptoryum-reprocessor --env-file .env -e RUN_MODE=reprocessor-only scriptoryum-worker
+```
+
+### Execução com Docker Compose
+```bash
+# Modo completo
+docker-compose up -d
+
+# Configurações específicas
+docker-compose -f docker-compose.single.yml --profile full up -d
+docker-compose -f docker-compose.single.yml --profile worker-only up -d
+```
+
+**📖 Para mais detalhes sobre Docker, consulte [DOCKER.md](DOCKER.md)**
+
+### Instalação de Dependências (Execução Local)
 
 ```bash
 pip install -r requirements.txt
-```
-
-2. Execute o worker:
-
-```bash
-python worker.py
 ```
 
 ## Fluxo de Processamento
