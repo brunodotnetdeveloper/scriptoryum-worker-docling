@@ -142,14 +142,36 @@ class DocumentProcessor:
     def download_document(self, storage_path, file_type):
         """Baixa o documento do Cloudflare R2 para um arquivo temporário."""
         try:
-            # Converte file_type para string se for um número
+            # Mapeia os tipos de arquivo do enum FileType para suas extensões
+            file_type_mapping = {
+                "PDF": "pdf",
+                "DOCX": "docx", 
+                "DOC": "doc",
+                "TXT": "txt",
+                "RTF": "rtf",
+                "ODT": "odt",
+                "HTML": "html",
+                "XML": "xml",
+                "XLS": "xls",
+                "XLSX": "xlsx",
+                "JSON": "json"
+            }
+            
+            # Converte file_type para string se for um número (compatibilidade com versões antigas)
             if isinstance(file_type, int):
                 logger.info(f"Convertendo file_type de inteiro {file_type} para string")
-                # Mapeia o valor inteiro para a extensão correspondente ou usa 'pdf' como padrão
-                file_type = "pdf"  # Valor padrão para casos desconhecidos
+                file_type = "PDF"  # Valor padrão para casos desconhecidos
+            
+            # Normaliza o file_type para maiúsculo
+            file_type_upper = str(file_type).upper()
+            
+            # Obtém a extensão correspondente ou usa 'pdf' como padrão
+            extension = file_type_mapping.get(file_type_upper, "pdf")
+            
+            logger.info(f"Tipo de arquivo: {file_type} -> Extensão: {extension}")
             
             # Cria um arquivo temporário com a extensão correta
-            suffix = f".{str(file_type).lower()}"
+            suffix = f".{extension}"
             with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as temp_file:
                 temp_path = temp_file.name
             
