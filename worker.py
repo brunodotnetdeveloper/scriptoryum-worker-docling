@@ -8,10 +8,15 @@ import redis
 import boto3
 import tempfile
 import traceback
+import io
 from dotenv import load_dotenv
 from enum import Enum
 from botocore.client import Config
-from docling.document_converter import DocumentConverter
+import pytesseract
+from PIL import Image
+import fitz  # PyMuPDF para PDFs
+import cv2
+import numpy as np
 
 # Configuração de logging
 logging.basicConfig(
@@ -87,8 +92,10 @@ class DocumentProcessor:
         )
         self.bucket_name = os.getenv('CLOUDFLARE_BUCKET_NAME')
         
-        # Inicializa o conversor de documentos Docling
-        self.doc_converter = DocumentConverter()
+        # Configuração do Tesseract OCR
+        tesseract_path = os.getenv('TESSERACT_PATH')
+        if tesseract_path:
+            pytesseract.pytesseract.tesseract_cmd = tesseract_path
         
         # Tempo máximo (em minutos) que um documento pode ficar no status ExtractingText
         self.max_extracting_time_minutes = 30
@@ -159,17 +166,85 @@ class DocumentProcessor:
             logger.error(f"Erro ao baixar documento {storage_path}: {str(e)}")
             raise
     
-    def extract_text(self, file_path):
-        """Extrai texto do documento usando Docling."""
+    def extract_text_from_image(self, image_path):
+        """Extrai texto de uma imagem usando Tesseract OCR."""
         try:
-            # Converte o documento usando Docling
-            result = self.doc_converter.convert(file_path)
+            # Abre a imagem
+            image = Image.open(image_path)
             
-            # Extrai o texto do documento convertido
-            text = result.document.export_to_text()
+            # Converte para RGB se necessário
+            if image.mode != 'RGB':
+                image = image.convert('RGB')
+            
+            # Extrai o texto usando Tesseract
+            text = pytesseract.image_to_string(image, lang='por+eng')
+            
+            return text.strip()
+        except Exception as e:
+            logger.error(f"Erro ao extrair texto da imagem: {str(e)}")
+            return ""
+    
+    def extract_text_from_pdf(self, pdf_path):
+        """Extrai texto de um PDF usando PyMuPDF e OCR quando necessário."""
+        try:
+            text = ""
+            doc = fitz.open(pdf_path)
+            
+            for page_num in range(len(doc)):
+                page = doc.load_page(page_num)
+                
+                # Primeiro tenta extrair texto diretamente
+                page_text = page.get_text()
+                
+                # Se não há texto ou muito pouco texto, usa OCR
+                if len(page_text.strip()) < 50:
+                    # Converte a página para imagem
+                    mat = fitz.Matrix(2.0, 2.0)  # Aumenta a resolução
+                    pix = page.get_pixmap(matrix=mat)
+                    img_data = pix.tobytes("png")
+                    
+                    # Converte para PIL Image
+                    image = Image.open(io.BytesIO(img_data))
+                    
+                    # Extrai texto usando OCR
+                    ocr_text = pytesseract.image_to_string(image, lang='por+eng')
+                    text += f"\n--- Página {page_num + 1} (OCR) ---\n{ocr_text}\n"
+                else:
+                    text += f"\n--- Página {page_num + 1} ---\n{page_text}\n"
+            
+            doc.close()
+            return text.strip()
+        except Exception as e:
+            logger.error(f"Erro ao extrair texto do PDF: {str(e)}")
+            return ""
+    
+    def extract_text(self, file_path):
+        """Extrai texto do documento usando Tesseract OCR e PyMuPDF."""
+        try:
+            # Determina o tipo de arquivo pela extensão
+            file_extension = os.path.splitext(file_path)[1].lower()
+            
+            text = ""
+            
+            if file_extension == '.pdf':
+                text = self.extract_text_from_pdf(file_path)
+            elif file_extension in ['.png', '.jpg', '.jpeg', '.tiff', '.bmp', '.gif']:
+                text = self.extract_text_from_image(file_path)
+            else:
+                # Para outros tipos de arquivo, tenta ler como texto simples
+                try:
+                    with open(file_path, 'r', encoding='utf-8') as f:
+                        text = f.read()
+                except UnicodeDecodeError:
+                    # Se falhar com UTF-8, tenta outras codificações
+                    try:
+                        with open(file_path, 'r', encoding='latin-1') as f:
+                            text = f.read()
+                    except Exception:
+                        logger.warning(f"Não foi possível ler o arquivo {file_path} como texto")
+                        text = ""
             
             # Limita o tamanho do texto para evitar problemas com documentos muito grandes
-            # Define um limite máximo de 10MB para o texto extraído
             max_text_size = 10 * 1024 * 1024  # 10MB em bytes
             if len(text) > max_text_size:
                 logger.warning(f"Texto extraído muito grande ({len(text)} bytes), truncando para {max_text_size} bytes")
@@ -187,7 +262,6 @@ class DocumentProcessor:
             # Retorna um texto de erro e um resumo indicando a falha
             error_text = f"ERRO NA EXTRAÇÃO DE TEXTO: {str(e)}"
             return error_text, error_text
-            # Não propaga a exceção para permitir que o documento seja marcado como falha
     
     def process_document(self, document_data):
         """Processa um documento da fila."""

@@ -1,5 +1,17 @@
-# Biblioteca principal para extração de texto
-docling
+# Biblioteca para OCR (Optical Character Recognition)
+pytesseract
+
+# Biblioteca para processamento de imagens
+Pillow
+
+# Biblioteca para processamento de PDFs
+PyMuPDF
+
+# Biblioteca para processamento de imagens avançado
+opencv-python
+
+# Biblioteca para arrays numéricos
+numpy
 
 # Conexão com banco de dados
 psycopg2-binary
@@ -18,7 +30,6 @@ pytz
 
 # Geração de embeddings
 sentence-transformers
-numpy
 
 # Monitoramento do sistema
 psutil
