@@ -25,6 +25,9 @@ boto3
 # Variáveis de ambiente
 python-dotenv
 
+# OpenAI API
+openai
+
 # Processamento de datas
 pytz
 
