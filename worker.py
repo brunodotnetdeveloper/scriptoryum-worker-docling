@@ -17,6 +17,8 @@ from PIL import Image
 import fitz  # PyMuPDF para PDFs
 import cv2
 import numpy as np
+from sentence_transformers import SentenceTransformer
+import re
 
 # Configuração de logging
 logging.basicConfig(
@@ -99,6 +101,15 @@ class DocumentProcessor:
         
         # Tempo máximo (em minutos) que um documento pode ficar no status ExtractingText
         self.max_extracting_time_minutes = 30
+        
+        # Inicializa o modelo de embeddings (768 dimensões)
+        try:
+            # Usando modelo que gera embeddings de 768 dimensões
+            self.embedding_model = SentenceTransformer('sentence-transformers/all-mpnet-base-v2')
+            logger.info("Modelo de embeddings carregado com sucesso (768 dimensões)")
+        except Exception as e:
+            logger.error(f"Erro ao carregar modelo de embeddings: {str(e)}")
+            self.embedding_model = None
     
     def update_document_status(self, document_id, status, text_extracted=None, summary=None):
         """Atualiza o status do documento no banco de dados."""
@@ -347,6 +358,14 @@ class DocumentProcessor:
                 self.update_document_status(document_id, DocumentStatus.TEXT_EXTRACTION_FAILED)
                 return False
             
+            # Divide o texto em chunks e gera embeddings
+            try:
+                self.create_document_chunks(document_id, text)
+            except Exception as chunk_error:
+                logger.error(f"Erro ao criar chunks do documento {document_id}: {str(chunk_error)}")
+                logger.error(traceback.format_exc())
+                # Continua mesmo se houver erro nos chunks
+            
             # Atualiza o documento com o texto extraído e status Processed
             try:
                 self.update_document_status(
@@ -395,6 +414,173 @@ class DocumentProcessor:
                     logger.info(f"Arquivo temporário {temp_file_path} removido")
                 except Exception as e:
                     logger.error(f"Erro ao remover arquivo temporário: {str(e)}")
+    
+    def split_text_into_chunks(self, text, chunk_size=1000, chunk_overlap=200):
+        """Divide o texto em chunks usando estratégia recursiva baseada no LangChain."""
+        if not text or len(text.strip()) == 0:
+            return []
+        
+        # Separadores hierárquicos (do mais específico para o mais geral)
+        separators = [
+            "\n\n",  # Parágrafos
+            "\n",    # Quebras de linha
+            ". ",    # Sentenças
+            "! ",    # Exclamações
+            "? ",    # Perguntas
+            "; ",    # Ponto e vírgula
+            ", ",    # Vírgulas
+            " ",     # Espaços
+            ""       # Caracteres individuais
+        ]
+        
+        chunks = []
+        current_chunks = [text]
+        
+        for separator in separators:
+            new_chunks = []
+            
+            for chunk in current_chunks:
+                if len(chunk) <= chunk_size:
+                    new_chunks.append(chunk)
+                else:
+                    # Divide usando o separador atual
+                    if separator == "":
+                        # Último recurso: divide por caracteres
+                        split_chunks = [chunk[i:i+chunk_size] for i in range(0, len(chunk), chunk_size)]
+                    else:
+                        split_chunks = chunk.split(separator)
+                    
+                    # Reconstrói os chunks respeitando o tamanho máximo
+                    current_chunk = ""
+                    for split_chunk in split_chunks:
+                        test_chunk = current_chunk + (separator if current_chunk else "") + split_chunk
+                        
+                        if len(test_chunk) <= chunk_size:
+                            current_chunk = test_chunk
+                        else:
+                            if current_chunk:
+                                new_chunks.append(current_chunk)
+                            current_chunk = split_chunk
+                    
+                    if current_chunk:
+                        new_chunks.append(current_chunk)
+            
+            current_chunks = new_chunks
+            
+            # Se todos os chunks estão dentro do tamanho, para
+            if all(len(chunk) <= chunk_size for chunk in current_chunks):
+                break
+        
+        # Aplica overlap se especificado
+        if chunk_overlap > 0 and len(current_chunks) > 1:
+            overlapped_chunks = []
+            for i, chunk in enumerate(current_chunks):
+                if i == 0:
+                    overlapped_chunks.append(chunk)
+                else:
+                    # Adiciona overlap do chunk anterior
+                    prev_chunk = current_chunks[i-1]
+                    overlap_text = prev_chunk[-chunk_overlap:] if len(prev_chunk) > chunk_overlap else prev_chunk
+                    overlapped_chunk = overlap_text + " " + chunk
+                    overlapped_chunks.append(overlapped_chunk)
+            current_chunks = overlapped_chunks
+        
+        # Remove chunks vazios e muito pequenos
+        final_chunks = [chunk.strip() for chunk in current_chunks if chunk.strip() and len(chunk.strip()) > 10]
+        
+        return final_chunks
+    
+    def generate_embedding(self, text):
+        """Gera embedding para um texto usando o modelo sentence-transformers."""
+        if not self.embedding_model:
+            logger.error("Modelo de embeddings não está disponível")
+            return None
+        
+        try:
+            # Limita o tamanho do texto para evitar problemas de memória
+            max_text_length = 8192  # Limite típico para modelos de embedding
+            if len(text) > max_text_length:
+                text = text[:max_text_length]
+            
+            # Gera o embedding
+            embedding = self.embedding_model.encode(text, convert_to_tensor=False)
+            
+            # Converte para lista Python (compatível com PostgreSQL)
+            embedding_list = embedding.tolist()
+            
+            # Verifica se o embedding tem 768 dimensões (all-mpnet-base-v2)
+            if len(embedding_list) != 768:
+                logger.warning(f"Embedding gerado tem {len(embedding_list)} dimensões, esperado 768")
+            
+            return embedding_list
+        except Exception as e:
+            logger.error(f"Erro ao gerar embedding: {str(e)}")
+            return None
+    
+    def create_document_chunks(self, document_id, text):
+        """Cria chunks do documento e salva no banco de dados com embeddings."""
+        if not text or len(text.strip()) == 0:
+            logger.warning(f"Texto vazio para documento {document_id}, pulando criação de chunks")
+            return
+        
+        try:
+            # Divide o texto em chunks
+            chunks = self.split_text_into_chunks(text, chunk_size=1000, chunk_overlap=200)
+            
+            if not chunks:
+                logger.warning(f"Nenhum chunk gerado para documento {document_id}")
+                return
+            
+            logger.info(f"Gerados {len(chunks)} chunks para documento {document_id}")
+            
+            # Remove chunks existentes do documento (se houver)
+            cursor = self.db_conn.cursor()
+            cursor.execute("DELETE FROM public.document_chunks WHERE document_id = %s", (document_id,))
+            
+            # Insere os novos chunks
+            for chunk_index, chunk_content in enumerate(chunks):
+                try:
+                    # Gera embedding para o chunk
+                    embedding = self.generate_embedding(chunk_content)
+                    
+                    if embedding is None:
+                        logger.warning(f"Não foi possível gerar embedding para chunk {chunk_index} do documento {document_id}")
+                        # Insere sem embedding
+                        cursor.execute(
+                            """
+                            INSERT INTO public.document_chunks (document_id, chunk_index, content, created_at)
+                            VALUES (%s, %s, %s, %s)
+                            """,
+                            (document_id, chunk_index, chunk_content, datetime.datetime.now())
+                        )
+                    else:
+                        # Insere com embedding
+                        cursor.execute(
+                            """
+                            INSERT INTO public.document_chunks (document_id, chunk_index, content, embedding, created_at)
+                            VALUES (%s, %s, %s, %s, %s)
+                            """,
+                            (document_id, chunk_index, chunk_content, embedding, datetime.datetime.now())
+                        )
+                    
+                    logger.debug(f"Chunk {chunk_index} inserido para documento {document_id}")
+                    
+                except Exception as chunk_error:
+                    logger.error(f"Erro ao inserir chunk {chunk_index} do documento {document_id}: {str(chunk_error)}")
+                    # Continua com os próximos chunks mesmo se um falhar
+                    continue
+            
+            # Confirma as alterações
+            self.db_conn.commit()
+            cursor.close()
+            
+            logger.info(f"Chunks salvos com sucesso para documento {document_id}")
+            
+        except Exception as e:
+            self.db_conn.rollback()
+            logger.error(f"Erro ao criar chunks para documento {document_id}: {str(e)}")
+            logger.error(traceback.format_exc())
+            raise
     
     def check_stuck_documents(self):
         """Verifica documentos que estão presos no status ExtractingText por muito tempo."""
