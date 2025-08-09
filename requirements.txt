@@ -28,8 +28,8 @@ python-dotenv
 # Processamento de datas
 pytz
 
-# Geração de embeddings
-sentence-transformers
+# Geração de embeddings com OpenAI (1536 dimensões)
+openai
 
 # Monitoramento do sistema
 psutil

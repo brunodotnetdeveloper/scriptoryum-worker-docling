@@ -5,7 +5,7 @@ import numpy as np
 import time
 import traceback
 from dotenv import load_dotenv
-from sentence_transformers import SentenceTransformer
+from openai import OpenAI
 
 # Configuração de logging
 logging.basicConfig(
@@ -28,19 +28,20 @@ class EmbeddingGenerator:
             port=os.getenv('DB_PORT')
         )
         
-        # Carrega o modelo de embeddings
-        self.model = SentenceTransformer('all-MiniLM-L6-v2')
-        logger.info("Modelo de embeddings carregado")
+        # API key global como fallback (opcional)
+        self.fallback_api_key = os.getenv('OPENAI_API_KEY')
+        logger.info("Gerador de embeddings inicializado - usando API keys dos usuários")
     
     def get_documents_without_embeddings(self, limit=10):
-        """Obtém chunks de documentos que ainda não têm embeddings."""
+        """Obtém chunks de documentos que ainda não têm embeddings, incluindo o user_id."""
         try:
             cursor = self.db_conn.cursor()
             
             query = """
-            SELECT id, document_id, content 
-            FROM public.document_chunks 
-            WHERE embedding IS NULL 
+            SELECT dc.id, dc.document_id, dc.content, d.uploaded_by_user_id
+            FROM public.document_chunks dc
+            JOIN public.documents d ON dc.document_id = d.id
+            WHERE dc.embedding IS NULL 
             LIMIT %s
             """
             
@@ -54,18 +55,81 @@ class EmbeddingGenerator:
             self.db_conn.rollback()
             return []
     
-    def generate_embedding(self, text):
-        """Gera um embedding para o texto fornecido."""
+    def get_user_openai_api_key(self, user_id):
+        """Obtém a API key do OpenAI do usuário baseada no provider padrão."""
+        try:
+            cursor = self.db_conn.cursor()
+            
+            query = """
+            SELECT apc.api_key 
+            FROM public.a_i_configurations ac
+            JOIN public.a_i_provider_configs apc ON ac.id = apc.a_i_configuration_id
+            WHERE ac.user_id = %s 
+              AND apc.provider = ac.default_provider 
+              AND apc.is_enabled = true
+              AND LOWER(apc.provider) = 'openai'
+            """
+            
+            cursor.execute(query, (user_id,))
+            result = cursor.fetchone()
+            cursor.close()
+            
+            if result:
+                return result[0]
+            else:
+                logger.warning(f"API key OpenAI não encontrada para usuário {user_id}")
+                return None
+        except Exception as e:
+            logger.error(f"Erro ao obter API key do usuário {user_id}: {str(e)}")
+            self.db_conn.rollback()
+            return None
+    
+    def get_openai_client(self, api_key):
+        """Cria um cliente OpenAI com a API key fornecida."""
+        try:
+            return OpenAI(api_key=api_key)
+        except Exception as e:
+            logger.error(f"Erro ao criar cliente OpenAI: {str(e)}")
+            return None
+
+    def generate_embedding(self, text, user_id=None):
+        """Gera um embedding para o texto fornecido usando a API key do usuário."""
         try:
             if not text or text.strip() == "":
-                return np.zeros(384)  # Retorna um vetor de zeros para texto vazio
+                return np.zeros(1536)  # Retorna um vetor de zeros para texto vazio
             
-            # Gera o embedding
-            embedding = self.model.encode(text)
+            # Tenta usar a API key do usuário primeiro
+            api_key = None
+            if user_id:
+                api_key = self.get_user_openai_api_key(user_id)
+            
+            # Se não encontrou API key do usuário, usa fallback
+            if not api_key:
+                api_key = self.fallback_api_key
+                if api_key:
+                    logger.info(f"Usando API key fallback para usuário {user_id}")
+                else:
+                    logger.error(f"Nenhuma API key disponível para usuário {user_id}")
+                    return np.zeros(1536)
+            else:
+                logger.info(f"Usando API key do usuário {user_id}")
+            
+            # Cria cliente OpenAI com a API key
+            openai_client = self.get_openai_client(api_key)
+            if not openai_client:
+                return np.zeros(1536)
+            
+            # Gera o embedding usando OpenAI
+            response = openai_client.embeddings.create(
+                model="text-embedding-ada-002",
+                input=text
+            )
+            
+            embedding = np.array(response.data[0].embedding)
             return embedding
         except Exception as e:
-            logger.error(f"Erro ao gerar embedding: {str(e)}")
-            return np.zeros(384)  # Retorna um vetor de zeros em caso de erro
+            logger.error(f"Erro ao gerar embedding para usuário {user_id}: {str(e)}")
+            return np.zeros(1536)  # Retorna um vetor de zeros em caso de erro
     
     def update_chunk_embedding(self, chunk_id, embedding):
         """Atualiza o embedding de um chunk no banco de dados."""
@@ -92,9 +156,9 @@ class EmbeddingGenerator:
             return False
     
     def process_chunks(self, batch_size=10):
-        """Processa chunks sem embeddings em lotes."""
+        """Processa chunks sem embeddings em lotes usando API keys dos usuários."""
         while True:
-            # Obtém chunks sem embeddings
+            # Obtém chunks sem embeddings (agora inclui user_id)
             chunks = self.get_documents_without_embeddings(batch_size)
             
             if not chunks:
@@ -105,17 +169,17 @@ class EmbeddingGenerator:
             logger.info(f"Processando {len(chunks)} chunks")
             
             for chunk in chunks:
-                chunk_id, document_id, content = chunk
+                chunk_id, document_id, content, user_id = chunk
                 
                 try:
-                    # Gera o embedding
-                    embedding = self.generate_embedding(content)
+                    # Gera o embedding usando a API key do usuário
+                    embedding = self.generate_embedding(content, user_id)
                     
                     # Atualiza o chunk no banco de dados
                     success = self.update_chunk_embedding(chunk_id, embedding)
                     
                     if success:
-                        logger.info(f"Embedding gerado para o chunk {chunk_id} do documento {document_id}")
+                        logger.info(f"Embedding gerado para o chunk {chunk_id} do documento {document_id} (usuário: {user_id})")
                     else:
                         logger.error(f"Falha ao atualizar embedding para o chunk {chunk_id}")
                 except Exception as e:
