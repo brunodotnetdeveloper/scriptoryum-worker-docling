@@ -29,5 +29,9 @@ RUN tesseract --version
 # Copiar o código da aplicação
 COPY . .
 
-# Comando para executar o worker
-CMD ["python", "worker.py"]
+# Comando para executar os serviços (configurável via RUN_MODE)
+# RUN_MODE=full (padrão): todos os serviços
+# RUN_MODE=worker-only: apenas worker
+# RUN_MODE=reprocessor-only: apenas reprocessador
+# RUN_MODE=monitor-only: apenas monitor
+CMD ["python", "docker-start.py"]
