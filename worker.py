@@ -20,6 +20,13 @@ import numpy as np
 from sentence_transformers import SentenceTransformer
 import re
 
+# Import condicional do OpenAI
+try:
+    from openai import OpenAI
+    OPENAI_AVAILABLE = True
+except ImportError:
+    OPENAI_AVAILABLE = False
+
 # Configuração de logging
 logging.basicConfig(
     level=logging.INFO,
@@ -102,11 +109,18 @@ class DocumentProcessor:
         # Tempo máximo (em minutos) que um documento pode ficar no status ExtractingText
         self.max_extracting_time_minutes = 30
         
-        # Inicializa o modelo de embeddings (768 dimensões)
+        # Inicializa o modelo de embeddings (768 dimensões -> 1536 com padding)
         try:
-            # Usando modelo que gera embeddings de 768 dimensões
-            self.embedding_model = SentenceTransformer('sentence-transformers/all-mpnet-base-v2')
-            logger.info("Modelo de embeddings carregado com sucesso (768 dimensões)")
+            # Carrega o modelo de embeddings gratuito (768 dimensões)
+            self.embedding_model = SentenceTransformer('all-mpnet-base-v2')
+            logger.info("Modelo de embeddings carregado: all-mpnet-base-v2 (768 dim) + padding para 1536 dim")
+            
+            # Configuração para OpenAI (opcional)
+            self.fallback_api_key = os.getenv('OPENAI_API_KEY')
+            if OPENAI_AVAILABLE and self.fallback_api_key:
+                logger.info("OpenAI disponível como opção premium para embeddings")
+            else:
+                logger.info("Usando apenas embeddings gratuitos com sentence-transformers")
         except Exception as e:
             logger.error(f"Erro ao carregar modelo de embeddings: {str(e)}")
             self.embedding_model = None
@@ -490,32 +504,106 @@ class DocumentProcessor:
         
         return final_chunks
     
-    def generate_embedding(self, text):
-        """Gera embedding para um texto usando o modelo sentence-transformers."""
+    def get_user_openai_api_key(self, user_id):
+        """Obtém a API key do OpenAI do usuário baseada no provider padrão."""
+        if not OPENAI_AVAILABLE or not user_id:
+            return None
+            
+        try:
+            cursor = self.db_conn.cursor()
+            
+            query = """
+            SELECT apc.api_key 
+            FROM public.a_i_configurations ac
+            JOIN public.a_i_provider_configs apc ON ac.id = apc.a_i_configuration_id
+            WHERE ac.user_id = %s 
+              AND apc.provider = ac.default_provider 
+              AND apc.is_enabled = true
+              AND LOWER(apc.provider) = 'openai'
+            """
+            
+            cursor.execute(query, (user_id,))
+            result = cursor.fetchone()
+            cursor.close()
+            
+            if result:
+                return result[0]
+            else:
+                return None
+        except Exception as e:
+            logger.error(f"Erro ao obter API key do usuário {user_id}: {str(e)}")
+            self.db_conn.rollback()
+            return None
+    
+    def generate_embedding_openai(self, text, api_key):
+        """Gera embedding usando OpenAI (1536 dimensões nativas)."""
+        try:
+            client = OpenAI(api_key=api_key)
+            response = client.embeddings.create(
+                model="text-embedding-ada-002",
+                input=text
+            )
+            return np.array(response.data[0].embedding).tolist()
+        except Exception as e:
+            logger.error(f"Erro ao gerar embedding OpenAI: {str(e)}")
+            return None
+    
+    def generate_embedding_free(self, text):
+        """Gera embedding gratuito usando sentence-transformers + padding (768 + 768 = 1536)."""
+        try:
+            # Gera embedding de 768 dimensões
+            embedding_768 = self.embedding_model.encode(text, convert_to_tensor=False)
+            
+            # Adiciona padding de zeros para chegar a 1536 dimensões
+            padding = np.zeros(768)
+            embedding_1536 = np.concatenate([embedding_768, padding])
+            
+            return embedding_1536.tolist()
+        except Exception as e:
+            logger.error(f"Erro ao gerar embedding gratuito: {str(e)}")
+            return np.zeros(1536).tolist()
+
+    def generate_embedding(self, text, user_id=None):
+        """Gera embedding de 1536 dimensões - OpenAI se disponível, senão gratuito com padding."""
         if not self.embedding_model:
             logger.error("Modelo de embeddings não está disponível")
             return None
-        
+
         try:
+            if not text or text.strip() == "":
+                return np.zeros(1536).tolist()
+            
             # Limita o tamanho do texto para evitar problemas de memória
             max_text_length = 8192  # Limite típico para modelos de embedding
             if len(text) > max_text_length:
                 text = text[:max_text_length]
             
-            # Gera o embedding
-            embedding = self.embedding_model.encode(text, convert_to_tensor=False)
+            # Tenta usar OpenAI se usuário tiver configuração
+            if user_id and OPENAI_AVAILABLE:
+                api_key = self.get_user_openai_api_key(user_id)
+                if api_key:
+                    embedding = self.generate_embedding_openai(text, api_key)
+                    if embedding is not None:
+                        logger.info(f"Embedding OpenAI gerado para usuário {user_id}")
+                        return embedding
+                    else:
+                        logger.warning(f"Falha no OpenAI para usuário {user_id}, usando método gratuito")
             
-            # Converte para lista Python (compatível com PostgreSQL)
-            embedding_list = embedding.tolist()
+            # Fallback para API key global se disponível
+            if OPENAI_AVAILABLE and self.fallback_api_key:
+                embedding = self.generate_embedding_openai(text, self.fallback_api_key)
+                if embedding is not None:
+                    logger.info(f"Embedding OpenAI (fallback) gerado para usuário {user_id}")
+                    return embedding
             
-            # Verifica se o embedding tem 768 dimensões (all-mpnet-base-v2)
-            if len(embedding_list) != 768:
-                logger.warning(f"Embedding gerado tem {len(embedding_list)} dimensões, esperado 768")
+            # Usa método gratuito com padding
+            embedding = self.generate_embedding_free(text)
+            logger.info(f"Embedding gratuito (768+768 padding) gerado para usuário {user_id}")
+            return embedding
             
-            return embedding_list
         except Exception as e:
-            logger.error(f"Erro ao gerar embedding: {str(e)}")
-            return None
+            logger.error(f"Erro ao gerar embedding para usuário {user_id}: {str(e)}")
+            return np.zeros(1536).tolist()
     
     def create_document_chunks(self, document_id, text):
         """Cria chunks do documento e salva no banco de dados com embeddings."""
@@ -523,6 +611,18 @@ class DocumentProcessor:
             logger.warning(f"Texto vazio para documento {document_id}, pulando criação de chunks")
             return
         
+        # Primeiro, obtém o user_id do documento
+        user_id = None
+        try:
+            cursor = self.db_conn.cursor()
+            cursor.execute("SELECT uploaded_by_user_id FROM public.documents WHERE id = %s", (document_id,))
+            result = cursor.fetchone()
+            if result:
+                user_id = result[0]
+            cursor.close()
+        except Exception as e:
+            logger.error(f"Erro ao obter user_id do documento {document_id}: {str(e)}")
+
         try:
             # Divide o texto em chunks
             chunks = self.split_text_into_chunks(text, chunk_size=1000, chunk_overlap=200)
@@ -540,8 +640,8 @@ class DocumentProcessor:
             # Insere os novos chunks
             for chunk_index, chunk_content in enumerate(chunks):
                 try:
-                    # Gera embedding para o chunk
-                    embedding = self.generate_embedding(chunk_content)
+                    # Gera embedding para o chunk usando a estratégia híbrida
+                    embedding = self.generate_embedding(chunk_content, user_id)
                     
                     if embedding is None:
                         logger.warning(f"Não foi possível gerar embedding para chunk {chunk_index} do documento {document_id}")
@@ -563,7 +663,7 @@ class DocumentProcessor:
                             (document_id, chunk_index, chunk_content, embedding, datetime.datetime.now())
                         )
                     
-                    logger.debug(f"Chunk {chunk_index} inserido para documento {document_id}")
+                    logger.debug(f"Chunk {chunk_index} inserido para documento {document_id} (usuário: {user_id})")
                     
                 except Exception as chunk_error:
                     logger.error(f"Erro ao inserir chunk {chunk_index} do documento {document_id}: {str(chunk_error)}")
