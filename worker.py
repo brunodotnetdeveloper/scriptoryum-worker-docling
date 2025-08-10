@@ -19,6 +19,8 @@ import cv2
 import numpy as np
 from sentence_transformers import SentenceTransformer
 import re
+import httpx
+import asyncio
 
 # Import condicional do OpenAI
 try:
@@ -109,6 +111,10 @@ class DocumentProcessor:
         # Tempo máximo (em minutos) que um documento pode ficar no status ExtractingText
         self.max_extracting_time_minutes = 30
         
+        # Configuração da API principal para notificações
+        self.main_api_url = os.getenv('MAIN_API_URL', 'http://localhost:5220')
+        self.main_api_token = os.getenv('MAIN_API_TOKEN')
+        
         # Inicializa o modelo de embeddings (768 dimensões -> 1536 com padding)
         try:
             # Carrega o modelo de embeddings gratuito (768 dimensões)
@@ -124,6 +130,59 @@ class DocumentProcessor:
         except Exception as e:
             logger.error(f"Erro ao carregar modelo de embeddings: {str(e)}")
             self.embedding_model = None
+    
+    async def create_notification(self, user_id: str, notification_type: str, title: str, message: str, document_id: int = None):
+        """Cria notificação via API principal"""
+        if not self.main_api_token:
+            logger.warning("MAIN_API_TOKEN não configurado, pulando criação de notificação")
+            return
+        
+        try:
+            notification_data = {
+                "userId": user_id,
+                "type": notification_type,
+                "title": title,
+                "message": message
+            }
+            
+            if document_id:
+                notification_data["documentId"] = document_id
+            
+            headers = {
+                "Authorization": f"Bearer {self.main_api_token}",
+                "Content-Type": "application/json"
+            }
+            
+            async with httpx.AsyncClient() as client:
+                response = await client.post(
+                    f"{self.main_api_url}/api/notifications",
+                    json=notification_data,
+                    headers=headers,
+                    timeout=10.0
+                )
+                
+                if response.status_code == 201:
+                    logger.info(f"Notificação criada com sucesso para usuário {user_id}: {title}")
+                else:
+                    logger.error(f"Erro ao criar notificação: {response.status_code} - {response.text}")
+                    
+        except Exception as e:
+            logger.error(f"Erro ao criar notificação: {str(e)}")
+    
+    def get_document_user_id(self, document_id):
+        """Obtém o ID do usuário que fez upload do documento"""
+        try:
+            cursor = self.db_conn.cursor()
+            cursor.execute("SELECT uploaded_by_user_id FROM public.documents WHERE id = %s", (document_id,))
+            result = cursor.fetchone()
+            cursor.close()
+            
+            if result:
+                return result[0]
+            return None
+        except Exception as e:
+            logger.error(f"Erro ao obter user_id do documento {document_id}: {str(e)}")
+            return None
     
     def update_document_status(self, document_id, status, text_extracted=None, summary=None):
         """Atualiza o status do documento no banco de dados."""
@@ -316,21 +375,44 @@ class DocumentProcessor:
         storage_path = document_data.get('StoragePath')
         file_type = document_data.get('FileType')
         temp_file_path = None
+        user_id = None
         
         # Validação básica dos dados do documento
         if not document_id:
             logger.error("DocumentId não encontrado nos dados do documento")
             return False
         
+        # Obtém o ID do usuário para notificações
+        user_id = self.get_document_user_id(document_id)
+        
         if not storage_path:
             logger.error(f"StoragePath não encontrado para o documento {document_id}")
             try:
                 self.update_document_status(document_id, DocumentStatus.TEXT_EXTRACTION_FAILED)
+                # Notifica sobre falha
+                if user_id:
+                    asyncio.run(self.create_notification(
+                        user_id,
+                        "DocumentProcessing",
+                        "Falha no processamento",
+                        f"Erro ao processar documento: caminho de armazenamento não encontrado",
+                        document_id
+                    ))
             except Exception:
                 pass
             return False
         
         try:
+            # Notifica início do processamento
+            if user_id:
+                asyncio.run(self.create_notification(
+                    user_id,
+                    "DocumentProcessing",
+                    "Processamento iniciado",
+                    f"Iniciando extração de texto do documento",
+                    document_id
+                ))
+            
             # Atualiza o status para ExtractingText
             self.update_document_status(document_id, DocumentStatus.EXTRACTING_TEXT)
             
@@ -341,12 +423,30 @@ class DocumentProcessor:
                 logger.error(f"Erro ao baixar documento {document_id}: {str(download_error)}")
                 logger.error(traceback.format_exc())
                 self.update_document_status(document_id, DocumentStatus.TEXT_EXTRACTION_FAILED)
+                # Notifica sobre falha no download
+                if user_id:
+                    asyncio.run(self.create_notification(
+                        user_id,
+                        "DocumentProcessing",
+                        "Falha no processamento",
+                        f"Erro ao baixar documento para processamento",
+                        document_id
+                    ))
                 return False
             
             # Verifica se o arquivo foi baixado corretamente
             if not temp_file_path or not os.path.exists(temp_file_path):
                 logger.error(f"Arquivo temporário não encontrado para o documento {document_id}")
                 self.update_document_status(document_id, DocumentStatus.TEXT_EXTRACTION_FAILED)
+                # Notifica sobre falha
+                if user_id:
+                    asyncio.run(self.create_notification(
+                        user_id,
+                        "DocumentProcessing",
+                        "Falha no processamento",
+                        f"Arquivo temporário não encontrado",
+                        document_id
+                    ))
                 return False
             
             # Verifica o tamanho do arquivo
@@ -359,6 +459,15 @@ class DocumentProcessor:
                 if file_size > max_file_size:
                     logger.error(f"Documento {document_id} muito grande ({file_size} bytes), excede o limite de {max_file_size} bytes")
                     self.update_document_status(document_id, DocumentStatus.TEXT_EXTRACTION_FAILED)
+                    # Notifica sobre arquivo muito grande
+                    if user_id:
+                        asyncio.run(self.create_notification(
+                            user_id,
+                            "DocumentProcessing",
+                            "Falha no processamento",
+                            f"Documento muito grande ({file_size // (1024*1024)}MB), excede o limite de 100MB",
+                            document_id
+                        ))
                     return False
             except Exception as size_error:
                 logger.error(f"Erro ao verificar tamanho do arquivo do documento {document_id}: {str(size_error)}")
@@ -370,6 +479,15 @@ class DocumentProcessor:
             if text.startswith("ERRO NA EXTRAÇÃO DE TEXTO"):
                 logger.error(f"Falha na extração de texto do documento {document_id}: {text}")
                 self.update_document_status(document_id, DocumentStatus.TEXT_EXTRACTION_FAILED)
+                # Notifica sobre falha na extração
+                if user_id:
+                    asyncio.run(self.create_notification(
+                        user_id,
+                        "DocumentProcessing",
+                        "Falha na extração de texto",
+                        f"Não foi possível extrair texto do documento",
+                        document_id
+                    ))
                 return False
             
             # Divide o texto em chunks e gera embeddings
@@ -405,7 +523,26 @@ class DocumentProcessor:
                     except Exception as truncate_error:
                         logger.error(f"Erro ao atualizar documento {document_id} com texto truncado: {str(truncate_error)}")
                         self.update_document_status(document_id, DocumentStatus.TEXT_EXTRACTION_FAILED)
+                        # Notifica sobre falha na atualização
+                        if user_id:
+                            asyncio.run(self.create_notification(
+                                user_id,
+                                "DocumentProcessing",
+                                "Falha no processamento",
+                                f"Erro ao salvar texto extraído do documento",
+                                document_id
+                            ))
                         return False
+            
+            # Notifica sucesso no processamento
+            if user_id:
+                asyncio.run(self.create_notification(
+                    user_id,
+                    "DocumentProcessing",
+                    "Processamento concluído",
+                    f"Texto extraído com sucesso ({len(text)} caracteres)",
+                    document_id
+                ))
             
             logger.info(f"Documento {document_id} processado com sucesso")
             return True
@@ -416,6 +553,15 @@ class DocumentProcessor:
             # Atualiza o status para falha
             try:
                 self.update_document_status(document_id, DocumentStatus.TEXT_EXTRACTION_FAILED)
+                # Notifica sobre erro geral
+                if user_id:
+                    asyncio.run(self.create_notification(
+                        user_id,
+                        "DocumentProcessing",
+                        "Falha no processamento",
+                        f"Erro inesperado durante o processamento do documento",
+                        document_id
+                    ))
             except Exception as update_error:
                 logger.error(f"Erro ao atualizar status de falha: {str(update_error)}")
             
@@ -692,7 +838,7 @@ class DocumentProcessor:
             
             # Busca documentos que estão no status ExtractingText por mais tempo que o limite
             query = """
-            SELECT id, storage_path, file_type 
+            SELECT id, storage_path, file_type, file_name
             FROM public.documents 
             WHERE status = %s AND updated_at < %s
             LIMIT 10
@@ -706,12 +852,23 @@ class DocumentProcessor:
                 logger.warning(f"Encontrados {len(stuck_documents)} documentos presos no status ExtractingText")
                 
                 for doc in stuck_documents:
-                    document_id, storage_path, file_type = doc
+                    document_id, storage_path, file_type, file_name = doc
                     logger.warning(f"Marcando documento {document_id} como falha (preso no status ExtractingText)")
                     
                     try:
                         self.update_document_status(document_id, DocumentStatus.TEXT_EXTRACTION_FAILED)
                         logger.info(f"Status do documento {document_id} atualizado para falha")
+                        
+                        # Criar notificação sobre documento preso
+                        user_id = self.get_document_user_id(document_id)
+                        if user_id:
+                            asyncio.run(self.create_notification(
+                                user_id=user_id,
+                                title="Processamento Interrompido",
+                                message=f"O processamento do documento '{file_name or 'documento'}' foi interrompido devido a timeout. Tente fazer o upload novamente.",
+                                type="error"
+                            ))
+                        
                     except Exception as e:
                         logger.error(f"Erro ao atualizar status do documento {document_id}: {str(e)}")
             
@@ -760,6 +917,17 @@ class DocumentProcessor:
                             try:
                                 self.update_document_status(document_id, DocumentStatus.TEXT_EXTRACTION_FAILED)
                                 logger.info(f"Status do documento {document_id} atualizado para falha")
+                                
+                                # Criar notificação sobre erro no processamento
+                                user_id = self.get_document_user_id(document_id)
+                                if user_id:
+                                    asyncio.run(self.create_notification(
+                                        user_id=user_id,
+                                        title="Erro no Processamento",
+                                        message=f"Ocorreu um erro durante o processamento do documento. Tente fazer o upload novamente.",
+                                        type="error"
+                                    ))
+                                
                             except Exception as update_error:
                                 logger.error(f"Erro ao atualizar status de falha para documento {document_id}: {str(update_error)}")
                     except json.JSONDecodeError as json_error:

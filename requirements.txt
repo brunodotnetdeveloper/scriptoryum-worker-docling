@@ -36,3 +36,6 @@ sentence-transformers
 
 # Monitoramento do sistema
 psutil
+
+# Cliente HTTP para chamadas à API
+httpx
