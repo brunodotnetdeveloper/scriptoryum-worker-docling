@@ -131,6 +131,61 @@ class DocumentProcessor:
             logger.error(f"Erro ao carregar modelo de embeddings: {str(e)}")
             self.embedding_model = None
     
+    def ensure_db_connection(self):
+        """Garante que a conexão com o banco de dados está ativa, reconectando se necessário."""
+        try:
+            # Testa a conexão executando uma query simples
+            if self.db_conn.closed:
+                logger.warning("Conexão com banco de dados está fechada, reconectando...")
+                self._reconnect_db()
+            else:
+                # Testa se a conexão está realmente funcionando
+                cursor = self.db_conn.cursor()
+                cursor.execute("SELECT 1")
+                cursor.fetchone()
+                cursor.close()
+        except (psycopg2.OperationalError, psycopg2.InterfaceError, AttributeError) as e:
+            logger.warning(f"Conexão com banco de dados perdida: {str(e)}, reconectando...")
+            self._reconnect_db()
+        except Exception as e:
+            logger.error(f"Erro inesperado ao verificar conexão: {str(e)}")
+            self._reconnect_db()
+    
+    def _reconnect_db(self):
+        """Reconecta ao banco de dados."""
+        try:
+            if hasattr(self, 'db_conn') and not self.db_conn.closed:
+                self.db_conn.close()
+        except:
+            pass
+        
+        self.db_conn = psycopg2.connect(
+            host=os.getenv('DB_HOST'),
+            database=os.getenv('DB_NAME'),
+            user=os.getenv('DB_USER'),
+            password=os.getenv('DB_PASSWORD'),
+            port=os.getenv('DB_PORT')
+        )
+        logger.info("Reconectado ao banco de dados com sucesso")
+    
+    def execute_with_retry(self, operation_func, max_retries=3, *args, **kwargs):
+        """Executa uma operação de banco de dados com retry automático em caso de falha de conexão."""
+        for attempt in range(max_retries):
+            try:
+                self.ensure_db_connection()
+                return operation_func(*args, **kwargs)
+            except (psycopg2.OperationalError, psycopg2.InterfaceError) as e:
+                logger.warning(f"Tentativa {attempt + 1}/{max_retries} falhou: {str(e)}")
+                if attempt < max_retries - 1:
+                    time.sleep(2 ** attempt)  # Backoff exponencial
+                    continue
+                else:
+                    logger.error(f"Todas as tentativas falharam para operação de banco de dados")
+                    raise
+            except Exception as e:
+                logger.error(f"Erro não relacionado à conexão: {str(e)}")
+                raise
+    
     async def create_notification(self, user_id: str, notification_type: str, title: str, message: str, document_id: int = None):
         """Cria notificação via API principal"""
         if not self.main_api_token:
@@ -153,6 +208,16 @@ class DocumentProcessor:
                 "Content-Type": "application/json"
             }
             
+            # Loga o JSON que será enviado para a API (sem expor o token)
+            try:
+                logger.info(
+                    f"Enviando notificação para {self.main_api_url}/api/notifications com payload: "
+                    f"{json.dumps(notification_data, ensure_ascii=False)}"
+                )
+                logger.debug("Cabeçalhos: {'Authorization': 'Bearer ****', 'Content-Type': 'application/json'}")
+            except Exception as log_err:
+                logger.warning(f"Falha ao serializar payload de notificação para log: {str(log_err)}")
+            
             async with httpx.AsyncClient() as client:
                 response = await client.post(
                     f"{self.main_api_url}/api/notifications",
@@ -171,12 +236,15 @@ class DocumentProcessor:
     
     def get_document_user_id(self, document_id):
         """Obtém o ID do usuário que fez upload do documento"""
-        try:
+        def _get_document_user_id_operation():
             cursor = self.db_conn.cursor()
             cursor.execute("SELECT uploaded_by_user_id FROM public.documents WHERE id = %s", (document_id,))
             result = cursor.fetchone()
             cursor.close()
-            
+            return result
+        
+        try:
+            result = self.execute_with_retry(_get_document_user_id_operation)
             if result:
                 return result[0]
             return None
@@ -186,7 +254,7 @@ class DocumentProcessor:
     
     def update_document_status(self, document_id, status, text_extracted=None, summary=None):
         """Atualiza o status do documento no banco de dados."""
-        try:
+        def _update_document_status_operation():
             cursor = self.db_conn.cursor()
             
             update_query = """
@@ -218,6 +286,9 @@ class DocumentProcessor:
             self.db_conn.commit()
             cursor.close()
             logger.info(f"Status do documento {document_id} atualizado para {status}")
+        
+        try:
+            self.execute_with_retry(_update_document_status_operation)
         except Exception as e:
             self.db_conn.rollback()
             logger.error(f"Erro ao atualizar status do documento {document_id}: {str(e)}")
@@ -830,7 +901,7 @@ class DocumentProcessor:
     
     def check_stuck_documents(self):
         """Verifica documentos que estão presos no status ExtractingText por muito tempo."""
-        try:
+        def _check_stuck_documents_operation():
             cursor = self.db_conn.cursor()
             
             # Calcula o tempo limite para considerar um documento como preso
@@ -838,7 +909,7 @@ class DocumentProcessor:
             
             # Busca documentos que estão no status ExtractingText por mais tempo que o limite
             query = """
-            SELECT id, storage_path, file_type, file_name
+            SELECT id, storage_path, file_type, COALESCE(original_file_name, processed_file_name) AS file_name
             FROM public.documents 
             WHERE status = %s AND updated_at < %s
             LIMIT 10
@@ -847,6 +918,11 @@ class DocumentProcessor:
             cursor.execute(query, (DocumentStatus.EXTRACTING_TEXT, time_limit))
             stuck_documents = cursor.fetchall()
             cursor.close()
+            
+            return stuck_documents
+        
+        try:
+            stuck_documents = self.execute_with_retry(_check_stuck_documents_operation)
             
             if stuck_documents:
                 logger.warning(f"Encontrados {len(stuck_documents)} documentos presos no status ExtractingText")
@@ -950,17 +1026,9 @@ class DocumentProcessor:
                     logger.info("Reconectado ao Redis")
                 except Exception as redis_error:
                     logger.error(f"Erro ao reconectar ao Redis: {str(redis_error)}")
-                # Tenta reconectar ao banco de dados se a conexão foi perdida
+                # Usa o método de reconexão robusto para o banco de dados
                 try:
-                    if self.db_conn.closed:
-                        self.db_conn = psycopg2.connect(
-                            host=os.getenv('DB_HOST'),
-                            database=os.getenv('DB_NAME'),
-                            user=os.getenv('DB_USER'),
-                            password=os.getenv('DB_PASSWORD'),
-                            port=os.getenv('DB_PORT')
-                        )
-                        logger.info("Reconectado ao banco de dados")
+                    self._reconnect_db()
                 except Exception as db_error:
                     logger.error(f"Erro ao reconectar ao banco de dados: {str(db_error)}")
 
