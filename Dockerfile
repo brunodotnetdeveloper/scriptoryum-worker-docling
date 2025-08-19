@@ -11,8 +11,8 @@ RUN apt-get update && apt-get install -y \
     tesseract-ocr-por \
     tesseract-ocr-eng \
     libtesseract-dev \
-    libgl1-mesa-dri \
-    libglu1-mesa \
+    libgl1-mesa-dev \
+    libglu1-mesa-dev \
     libglib2.0-0 \
     libsm6 \
     libxext6 \
