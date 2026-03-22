@@ -6,7 +6,7 @@ import datetime
 import psycopg2
 import redis
 from dotenv import load_dotenv
-from worker import DocumentProcessor, DocumentStatus
+from document_worker import DocumentProcessor, DocumentStatus
 
 # Configuração de logging
 logging.basicConfig(

@@ -25,7 +25,7 @@ def main():
     if run_mode == 'worker-only':
         # Executar apenas o worker
         logger.info("Executando apenas o worker")
-        subprocess.run([sys.executable, 'worker.py'])
+        subprocess.run([sys.executable, 'document_worker.py'])
         
     elif run_mode == 'reprocessor-only':
         # Executar apenas o reprocessador

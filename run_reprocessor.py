@@ -9,7 +9,7 @@ import sys
 import argparse
 import logging
 from dotenv import load_dotenv
-from reprocessor import DocumentReprocessor
+from document_reprocessor import DocumentReprocessor
 
 # Configuração de logging
 logging.basicConfig(

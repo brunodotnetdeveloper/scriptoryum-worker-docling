@@ -101,7 +101,7 @@ def main():
     atexit.register(stop_all_processes)
     
     # Inicia o worker principal
-    start_process('worker.py', 'Document Worker')
+    start_process('document_worker.py', 'Document Worker')
     
     # Aguarda um pouco para garantir que o worker principal esteja em execução
     time.sleep(2)
@@ -113,7 +113,7 @@ def main():
     time.sleep(2)
     
     # Inicia o reprocessador de documentos
-    start_process('reprocessor.py', 'Document Reprocessor')
+    start_process('document_reprocessor.py', 'Document Reprocessor')
     
     # Inicia o monitor de processos
     try:

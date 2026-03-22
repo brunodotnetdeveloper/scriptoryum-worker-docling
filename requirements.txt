@@ -33,3 +33,6 @@ openai
 
 # Monitoramento do sistema
 psutil
+
+# Geração de embeddings com modelos open-source
+sentence-transformers
